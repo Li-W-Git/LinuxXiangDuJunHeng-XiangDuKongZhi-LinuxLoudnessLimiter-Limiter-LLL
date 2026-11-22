@@ -1,0 +1,477 @@
+#include <pulse/pulseaudio.h>
+#include <getopt.h>
+#include <math.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#define VIRTUAL_SINK "loudness_limiter_native"
+#define PLUGIN_NAME "/usr/local/lib/loudness-limiter/loudness-limiter-ladspa.so"
+#define SHM_NAME "/loudness-limiter-limit"
+
+typedef struct {
+    pa_mainloop *mainloop;
+    pa_context *context;
+    char *hardware_sink;
+    char *original_sink;
+    uint32_t module_index;
+    float limit_db;
+    float default_limit_db;
+    float shared_limit;
+    int shm_fd;
+    volatile float *shared_limit_ptr;
+    pthread_t stdin_thread;
+    bool stdin_thread_started;
+    struct termios original_terminal;
+    bool terminal_changed;
+} state;
+
+static volatile sig_atomic_t stopping;
+static void on_signal(int sig) { (void)sig; stopping = 1; }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void restore_terminal(state *s) {
+    if (s->terminal_changed) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &s->original_terminal);
+        s->terminal_changed = false;
+    }
+}
+
+static void *stdin_thread_main(void *userdata) {
+    state *s = userdata;
+    char ch;
+    while (!stopping && read(STDIN_FILENO, &ch, 1) == 1) {
+        if (ch == 'q') {
+            stopping = 1;
+            printf("\r正在退出并恢复原设备...\n");
+            fflush(stdout);
+        } else if (ch == '+' || ch == '=') {
+            s->limit_db = clampf(s->limit_db + 1.0f, -100.0f, 0.0f);
+            s->shared_limit = s->limit_db;
+            if (s->shared_limit_ptr) *s->shared_limit_ptr = s->limit_db;
+            printf("\r限制幅度：%.1f dBFS\n", s->limit_db); fflush(stdout);
+        } else if (ch == '-' || ch == '_') {
+            s->limit_db = clampf(s->limit_db - 1.0f, -100.0f, 0.0f);
+            s->shared_limit = s->limit_db;
+            if (s->shared_limit_ptr) *s->shared_limit_ptr = s->limit_db;
+            printf("\r限制幅度：%.1f dBFS\n", s->limit_db); fflush(stdout);
+        } else if (ch == '0') {
+            s->limit_db = s->default_limit_db;
+            s->shared_limit = s->limit_db;
+            if (s->shared_limit_ptr) *s->shared_limit_ptr = s->limit_db;
+            printf("\r限制幅度已重置：%.1f dBFS\n", s->limit_db); fflush(stdout);
+        } else if (ch == 'h' || ch == '?') {
+            printf("\r+ 提高限制；- 降低限制；0 重置为默认值；q/Ctrl+C 退出\n"); fflush(stdout);
+        }
+    }
+    return NULL;
+}
+
+static void enable_terminal_controls(state *s) {
+    if (!isatty(STDIN_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &s->original_terminal) != 0) return;
+    struct termios raw = s->original_terminal;
+    raw.c_lflag &= (tcflag_t)~ICANON;
+    raw.c_lflag &= (tcflag_t)~ECHO;
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
+        s->terminal_changed = true;
+    if (pthread_create(&s->stdin_thread, NULL, stdin_thread_main, s) == 0)
+        s->stdin_thread_started = true;
+}
+
+static void move_sink_inputs_to_hardware(pa_context *c,
+                                          const pa_sink_input_info *i,
+                                          int eol, void *userdata) {
+    state *s = userdata;
+    if (eol || !i) return;
+    pa_context_move_sink_input_by_name(c, i->index, s->hardware_sink, NULL, NULL);
+}
+
+static void move_sink_inputs_to_limiter(pa_context *c,
+                                         const pa_sink_input_info *i,
+                                         int eol, void *userdata) {
+    (void)userdata;
+    if (eol || !i) return;
+    pa_context_move_sink_input_by_name(c, i->index, VIRTUAL_SINK, NULL, NULL);
+}
+
+static void cleanup(state *s) {
+    if (!s->context) return;
+    if (s->original_sink)
+        pa_context_set_default_sink(s->context, s->original_sink, NULL, NULL);
+    pa_context_get_sink_input_info_list(s->context, move_sink_inputs_to_hardware, s);
+    for (int n = 0; n < 1000; ++n)
+        pa_mainloop_iterate(s->mainloop, 0, NULL);
+    if (s->module_index != PA_INVALID_INDEX)
+        pa_context_unload_module(s->context, s->module_index, NULL, NULL);
+    for (int n = 0; n < 1000; ++n)
+        pa_mainloop_iterate(s->mainloop, 0, NULL);
+}
+
+static void module_loaded(pa_context *c, uint32_t index, void *userdata) {
+    state *s = userdata;
+    if (index == PA_INVALID_INDEX) {
+        fprintf(stderr, "无法加载原生 LADSPA sink 模块。请确认插件已安装并重启音频服务。\n");
+        stopping = 1;
+        return;
+    }
+    s->module_index = index;
+    pa_context_set_default_sink(c, VIRTUAL_SINK, NULL, NULL);
+    pa_operation *op = pa_context_get_sink_input_info_list(c, move_sink_inputs_to_limiter, s);
+    if (op) pa_operation_unref(op);
+    printf("原生响度处理已启动：硬件输出=%s，硬上限=%.1f dBFS\n",
+           s->hardware_sink, s->limit_db);
+    fflush(stdout);
+}
+
+static void server_info(pa_context *c, const pa_server_info *info, void *userdata) {
+    state *s = userdata;
+    if (!info || !info->default_sink_name) {
+        stopping = 1;
+        return;
+    }
+    free(s->original_sink);
+    s->original_sink = strdup(info->default_sink_name);
+    if (!s->hardware_sink)
+        s->hardware_sink = strdup(info->default_sink_name);
+
+    char plugin[1024];
+    plugin[0] = '\0';
+    char executable[1024];
+    ssize_t executable_len = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (executable_len > 0) {
+        executable[executable_len] = '\0';
+        char *slash = strrchr(executable, '/');
+        if (slash) {
+            *slash = '\0';
+            size_t dir_len = strlen(executable);
+            if (dir_len < sizeof(plugin) - 28)
+                snprintf(plugin, sizeof(plugin), "%s/loudness-limiter-ladspa.so", executable);
+            if (access(plugin, R_OK) != 0)
+                plugin[0] = '\0';
+        }
+    } else {
+        plugin[0] = '\0';
+    }
+
+    if (!plugin[0] && access(PLUGIN_NAME, R_OK) == 0) {
+        snprintf(plugin, sizeof(plugin), "%s", PLUGIN_NAME);
+    } else if (!plugin[0]) {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            snprintf(plugin, sizeof(plugin), "%s/.local/lib/loudness-limiter/loudness-limiter-ladspa.so", home);
+        }
+    }
+    if (!plugin[0]) {
+        char cwd[1024];
+        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+        snprintf(plugin, sizeof(plugin), "%s/loudness-limiter-ladspa.so", cwd);
+    }
+
+    char args[2048];
+    snprintf(args, sizeof(args),
+             "sink_name=%s sink_master=%s plugin=%s label=loudness_limiter_native "
+             "control=-18,6,%.1f",
+             VIRTUAL_SINK, s->hardware_sink, plugin, s->limit_db);
+    pa_context_load_module(c, "module-ladspa-sink", args, module_loaded, s);
+}
+
+static void context_state(pa_context *c, void *userdata) {
+    state *s = userdata;
+    pa_context_state_t st = pa_context_get_state(c);
+    if (st == PA_CONTEXT_READY)
+        pa_context_get_server_info(c, server_info, s);
+    else if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) {
+        if (!stopping) fprintf(stderr, "音频服务连接中断。\n");
+        stopping = 1;
+    }
+}
+
+static int mkdir_one(const char *path);
+
+static int config_path(char *path, size_t size) {
+    char executable[4096];
+    ssize_t executable_len = readlink("/proc/self/exe", executable,
+                                      sizeof(executable) - 1);
+    if (executable_len <= 0) return -1;
+    executable[executable_len] = '\0';
+
+    char *slash = strrchr(executable, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+
+    if (strlen(executable) >= size - 26) return -1;
+    snprintf(path, size, "%s/loudness-limiter.conf", executable);
+    return 0;
+}
+
+static float load_default_limit(void) {
+    char path[2048];
+    if (config_path(path, sizeof(path)) != 0) return -32.0f;
+
+    FILE *file = fopen(path, "r");
+    if (!file) return -32.0f;
+
+    char line[128];
+    while (fgets(line, sizeof(line), file)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        if (strcmp(line, "limit_db") == 0) {
+            char *end = NULL;
+            float value = strtof(eq, &end);
+            if (end != eq)
+                value = clampf(value, -100.0f, 0.0f);
+            else
+                value = -32.0f;
+            fclose(file);
+            return value;
+        }
+    }
+    fclose(file);
+    return -32.0f;
+}
+
+static int set_default_limit(float value) {
+    char path[2048];
+    if (config_path(path, sizeof(path)) != 0) return -1;
+    FILE *file = fopen(path, "w");
+    if (!file) return -1;
+    fprintf(file, "limit_db=%.1f\n", clampf(value, -100.0f, 0.0f));
+    fclose(file);
+    return 0;
+}
+
+static int reset_default_limit(void) {
+    char path[2048];
+    if (config_path(path, sizeof(path)) != 0) return -1;
+    if (unlink(path) == 0 || errno == ENOENT) return 0;
+    return -1;
+}
+
+static int mkdir_one(const char *path) {
+    if (mkdir(path, 0700) == 0) return 0;
+    return errno == EEXIST ? 0 : -1;
+}
+
+static int autostart_path(char *path, size_t size) {
+    const char *config = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    char base[4096];
+
+    if (home && *home)
+        snprintf(base, sizeof(base), "%s/.config", home);
+    else if (config && *config)
+        snprintf(base, sizeof(base), "%s", config);
+    else
+        return -1;
+
+    if (mkdir_one(base) != 0) return -1;
+    size_t base_len = strlen(base);
+    if (base_len >= 4096 - 11) return -1;
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s/autostart", base);
+    if (mkdir_one(dir) != 0) return -1;
+
+    size_t dir_len = strlen(dir);
+    if (dir_len >= size - 26) return -1;
+    snprintf(path, size, "%s/loudness-limiter.desktop", dir);
+    return 0;
+}
+
+static int autostart_enable(void) {
+    char path[2048];
+    if (autostart_path(path, sizeof(path)) != 0) return -1;
+
+    FILE *file = fopen(path, "w");
+    if (!file) return -1;
+    char executable[1024];
+    ssize_t executable_len = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (executable_len <= 0)
+        snprintf(executable, sizeof(executable), "/usr/local/bin/loudness-limiter");
+    else
+        executable[executable_len] = '\0';
+
+    fprintf(file,
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Linux Loudness Limiter\n"
+            "Comment=Start native system loudness limiting\n"
+            "Exec=%s\n"
+            "Icon=audio-volume-high\n"
+            "Terminal=true\n"
+            "X-GNOME-Autostart-enabled=true\n"
+            "X-KDE-autostart-after=panel\n",
+            executable);
+    fclose(file);
+    printf("已启用开机自启动：%s\n", path);
+    return 0;
+}
+
+static int autostart_disable(void) {
+    char path[2048];
+    if (autostart_path(path, sizeof(path)) != 0) return -1;
+    if (unlink(path) == 0)
+        printf("已禁用开机自启动：%s\n", path);
+    else if (errno == ENOENT)
+        printf("开机自启动已处于禁用状态\n");
+    else
+        return -1;
+    return 0;
+}
+
+static int autostart_status(void) {
+    char path[2048];
+    if (autostart_path(path, sizeof(path)) != 0) return -1;
+    if (access(path, R_OK) == 0)
+        printf("开机自启动：已启用（%s）\n", path);
+    else
+        printf("开机自启动：已禁用\n");
+    return 0;
+}
+
+static void usage(const char *name) {
+    printf("用法：%s [选项]\n", name);
+    printf("  -l, --limit DB        单次运行绝对上限（范围 0 到 -100 dBFS）\n");
+    printf("      --enable-autostart 启用开机自启动\n");
+    printf("      --disable-autostart 禁用开机自启动\n");
+    printf("      --autostart-status 查看开机自启动状态\n");
+    printf("      --set-default-limit DB 保存默认限制幅度（0 到 -100 dBFS）\n");
+    printf("      --get-default-limit 查询保存的默认限制幅度\n");
+    printf("      --reset-default-limit 恢复默认限制幅度为 -32 dBFS\n");
+    printf("  -s, --sink NAME       指定硬件 sink 名称\n");
+    printf("  -h, --help            显示帮助\n");
+    printf("运行中：+ 提高上限；- 降低上限；0 重置为保存的默认值；q 或 Ctrl+C 退出\n");
+}
+
+int main(int argc, char **argv) {
+    state s;
+    memset(&s, 0, sizeof(s));
+    s.default_limit_db = load_default_limit();
+    s.limit_db = s.default_limit_db;
+    s.shared_limit = s.limit_db;
+    s.module_index = PA_INVALID_INDEX;
+
+    static const struct option options[] = {
+        {"limit", required_argument, NULL, 'l'},
+        {"sink", required_argument, NULL, 's'},
+        {"enable-autostart", no_argument, NULL, 1000},
+        {"disable-autostart", no_argument, NULL, 1001},
+        {"autostart-status", no_argument, NULL, 1002},
+        {"set-default-limit", required_argument, NULL, 1003},
+        {"get-default-limit", no_argument, NULL, 1004},
+        {"reset-default-limit", no_argument, NULL, 1005},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "l:s:h", options, NULL)) != -1) {
+        switch (opt) {
+            case 'l': s.limit_db = clampf(strtof(optarg, NULL), -100.0f, 0.0f); break;
+            case 's': s.hardware_sink = strdup(optarg); break;
+            case 1000: {
+                int result = autostart_enable();
+                free(s.hardware_sink); free(s.original_sink);
+                return result == 0 ? 0 : 1;
+            }
+            case 1001: {
+                int result = autostart_disable();
+                free(s.hardware_sink); free(s.original_sink);
+                return result == 0 ? 0 : 1;
+            }
+            case 1002: {
+                int result = autostart_status();
+                free(s.hardware_sink); free(s.original_sink);
+                return result == 0 ? 0 : 1;
+            }
+            case 1003: {
+                char *end = NULL;
+                float value = strtof(optarg, &end);
+                if (end == optarg || *end != '\0' || value < -100.0f || value > 0.0f) {
+                    fprintf(stderr, "默认限制幅度必须为 0 到 -100 dBFS\n");
+                    free(s.hardware_sink); free(s.original_sink);
+                    return 1;
+                }
+                int result = set_default_limit(value);
+                if (result == 0) printf("已保存默认限制幅度：%.1f dBFS\n", value);
+                free(s.hardware_sink); free(s.original_sink);
+                return result == 0 ? 0 : 1;
+            }
+            case 1004: {
+                float value = load_default_limit();
+                printf("默认限制幅度：%.1f dBFS\n", value);
+                free(s.hardware_sink); free(s.original_sink);
+                return 0;
+            }
+            case 1005: {
+                int result = reset_default_limit();
+                if (result == 0) printf("已恢复默认限制幅度：-32.0 dBFS\n");
+                free(s.hardware_sink); free(s.original_sink);
+                return result == 0 ? 0 : 1;
+            }
+            case 'h': usage(argv[0]); free(s.hardware_sink); free(s.original_sink); return 0;
+            default: usage(argv[0]); free(s.hardware_sink); free(s.original_sink); return 1;
+        }
+    }
+
+    s.shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0600);
+    if (s.shm_fd >= 0) {
+        ftruncate(s.shm_fd, sizeof(float));
+        s.shared_limit_ptr = mmap(NULL, sizeof(float), PROT_READ | PROT_WRITE,
+                                  MAP_SHARED, s.shm_fd, 0);
+        if (s.shared_limit_ptr == MAP_FAILED) s.shared_limit_ptr = NULL;
+        else *s.shared_limit_ptr = s.limit_db;
+    }
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    s.mainloop = pa_mainloop_new();
+    if (!s.mainloop) { fprintf(stderr, "无法创建音频事件循环。\n"); return 1; }
+
+    enable_terminal_controls(&s);
+    printf("限制幅度：%.1f dBFS（+ 提高，- 降低，0 重置为默认值，q/Ctrl+C 退出）\n", s.limit_db);
+    fflush(stdout);
+
+    s.context = pa_context_new(pa_mainloop_get_api(s.mainloop), "Native Loudness Limiter");
+    pa_context_set_state_callback(s.context, context_state, &s);
+    if (pa_context_connect(s.context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
+        fprintf(stderr, "无法连接 PulseAudio/PipeWire：%s\n", pa_strerror(pa_context_errno(s.context)));
+        restore_terminal(&s);
+        return 1;
+    }
+
+    int retval = 0;
+    while (!stopping) {
+        if (pa_mainloop_iterate(s.mainloop, 0, &retval) < 0) break;
+        usleep(5000);
+    }
+
+    cleanup(&s);
+    restore_terminal(&s);
+    for (int n = 0; n < 100; ++n)
+        pa_mainloop_iterate(s.mainloop, 0, &retval);
+
+    pa_context_disconnect(s.context);
+    pa_context_unref(s.context);
+    pa_mainloop_free(s.mainloop);
+
+    if (s.shared_limit_ptr) munmap((void *)s.shared_limit_ptr, sizeof(float));
+    if (s.shm_fd >= 0) close(s.shm_fd);
+    shm_unlink(SHM_NAME);
+    free(s.hardware_sink);
+    free(s.original_sink);
+    return retval;
+}
