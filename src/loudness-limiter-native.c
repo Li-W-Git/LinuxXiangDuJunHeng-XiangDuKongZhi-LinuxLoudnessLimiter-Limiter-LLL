@@ -37,6 +37,8 @@ typedef struct {
     struct termios original_terminal;
     bool terminal_changed;
     char *extracted_plugin;
+    int watchdog_write_fd;
+    int stale_unload_pending;
 } state;
 
 extern const unsigned char _binary_loudness_limiter_ladspa_so_start[];
@@ -44,6 +46,101 @@ extern const unsigned char _binary_loudness_limiter_ladspa_so_end[];
 
 static volatile sig_atomic_t stopping;
 static void on_signal(int sig) { (void)sig; stopping = 1; }
+
+static void emergency_sink_cb(pa_context *c,
+                              const pa_sink_info *info,
+                              int eol, void *userdata) {
+    (void)userdata;
+    if (eol || !info) return;
+    if (strstr(info->name, "loudness_limiter") ||
+        strstr(info->name, "loudness-limiter")) return;
+
+    pa_cvolume volume;
+    pa_cvolume_mute(&volume, 2);
+    pa_context_set_sink_volume_by_name(c, info->name, &volume, NULL, NULL);
+    pa_context_set_sink_mute_by_name(c, info->name, 1, NULL, NULL);
+}
+
+static void emergency_module_cb(pa_context *c,
+                                const pa_module_info *info,
+                                int eol, void *userdata) {
+    (void)userdata;
+    if (eol || !info) return;
+    if (info->name && strcmp(info->name, "module-ladspa-sink") == 0 &&
+        info->argument && strstr(info->argument, "sink_name=loudness_limiter_native"))
+        pa_context_unload_module(c, info->index, NULL, NULL);
+}
+
+static void emergency_context_cb(pa_context *c, void *userdata) {
+    pa_mainloop *mainloop = userdata;
+    pa_context_state_t st = pa_context_get_state(c);
+    if (st == PA_CONTEXT_READY) {
+        pa_context_get_sink_info_list(c, emergency_sink_cb, NULL);
+        pa_context_get_module_info_list(c, emergency_module_cb, NULL);
+    } else if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) {
+        pa_mainloop_quit(mainloop, 1);
+    }
+}
+
+static void emergency_cleanup(void) {
+    pa_mainloop *mainloop = pa_mainloop_new();
+    if (!mainloop) _exit(1);
+
+    pa_context *context = pa_context_new(pa_mainloop_get_api(mainloop),
+                                         "Loudness Limiter Watchdog");
+    if (!context) {
+        pa_mainloop_free(mainloop);
+        _exit(1);
+    }
+
+    pa_context_set_state_callback(context, emergency_context_cb, mainloop);
+    pa_context_connect(context, NULL, PA_CONTEXT_NOFLAGS, NULL);
+
+    int retval = 0;
+    for (int n = 0; n < 4000; ++n)
+        pa_mainloop_iterate(mainloop, 0, &retval);
+
+    pa_context_disconnect(context);
+    pa_context_unref(context);
+    pa_mainloop_free(mainloop);
+    _exit(0);
+}
+
+static pid_t start_watchdog(state *s) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        s->watchdog_write_fd = -1;
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        s->watchdog_write_fd = -1;
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[1]);
+        char byte;
+        if (read(pipefd[0], &byte, 1) <= 0)
+            emergency_cleanup();
+        close(pipefd[0]);
+        _exit(0);
+    }
+
+    close(pipefd[0]);
+    s->watchdog_write_fd = pipefd[1];
+    return pid;
+}
+
+static void stop_watchdog(state *s) {
+    if (s->watchdog_write_fd >= 0) {
+        close(s->watchdog_write_fd);
+        s->watchdog_write_fd = -1;
+    }
+}
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static void remove_extracted_plugin(state *s) {
@@ -178,8 +275,23 @@ static void move_sink_inputs_to_limiter(pa_context *c,
     pa_context_move_sink_input_by_name(c, i->index, VIRTUAL_SINK, NULL, NULL);
 }
 
+static void mute_hardware_sink(state *s) {
+    if (!s->context || !s->hardware_sink) return;
+
+    pa_context_set_sink_mute_by_name(s->context, s->hardware_sink, 1,
+                                     NULL, NULL);
+
+    pa_cvolume volume;
+    pa_cvolume_mute(&volume, 2);
+    pa_context_set_sink_volume_by_name(s->context, s->hardware_sink,
+                                       &volume, NULL, NULL);
+}
+
 static void cleanup(state *s) {
     if (!s->context) return;
+
+    mute_hardware_sink(s);
+
     if (s->original_sink)
         pa_context_set_default_sink(s->context, s->original_sink, NULL, NULL);
     pa_context_get_sink_input_info_list(s->context, move_sink_inputs_to_hardware, s);
@@ -208,29 +320,119 @@ static void module_loaded(pa_context *c, uint32_t index, void *userdata) {
     fflush(stdout);
 }
 
+static void load_native_sink(state *s);
+
+static void stale_module_unloaded(pa_context *c, int success, void *userdata) {
+    (void)c;
+    state *s = userdata;
+    (void)success;
+    if (s->stale_unload_pending > 0)
+        s->stale_unload_pending--;
+    if (s->stale_unload_pending == 0)
+        load_native_sink(s);
+}
+
+static void stale_module_info_cb(pa_context *c,
+                                 const pa_module_info *i,
+                                 int eol, void *userdata) {
+    state *s = userdata;
+    if (eol) {
+        if (s->stale_unload_pending == 0)
+            load_native_sink(s);
+        return;
+    }
+    if (!i) return;
+
+    if (i->name && strcmp(i->name, "module-ladspa-sink") == 0 &&
+        i->argument && strstr(i->argument, "sink_name=" VIRTUAL_SINK) != NULL) {
+        s->stale_unload_pending++;
+        pa_context_unload_module(c, i->index, stale_module_unloaded, s);
+    }
+}
+
+static void scan_stale_modules(state *s) {
+    s->stale_unload_pending = 0;
+    pa_context_get_module_info_list(s->context,
+                                    stale_module_info_cb, s);
+}
+
+static void enable_hardware_audio(state *s) {
+    if (!s->context || !s->hardware_sink) return;
+
+    pa_context_set_sink_mute_by_name(s->context, s->hardware_sink, 0,
+                                     NULL, NULL);
+    pa_cvolume volume;
+    pa_cvolume_set(&volume, 2, PA_VOLUME_NORM);
+    pa_context_set_sink_volume_by_name(s->context, s->hardware_sink,
+                                       &volume, NULL, NULL);
+}
+
+static void load_native_sink(state *s) {
+    if (!s->context || !s->hardware_sink || !s->extracted_plugin) return;
+
+    enable_hardware_audio(s);
+
+    char args[8192];
+    snprintf(args, sizeof(args),
+             "sink_name=%s sink_master=%s plugin=%s label=loudness_limiter_native "
+             "control=-18,6,%.1f",
+             VIRTUAL_SINK, s->hardware_sink,
+             s->extracted_plugin, s->limit_db);
+    pa_context_load_module(s->context, "module-ladspa-sink", args,
+                           module_loaded, s);
+}
+
+static void hardware_sink_selected(pa_context *c,
+                                   const pa_sink_info *info,
+                                   int eol, void *userdata) {
+    (void)c;
+    state *s = userdata;
+    if (eol) {
+        if (!s->hardware_sink) {
+            fprintf(stderr, "无法找到真实硬件输出设备。\n");
+            stopping = 1;
+        }
+        return;
+    }
+    if (!info || s->hardware_sink) return;
+
+    if (strstr(info->name, "loudness_limiter") == NULL &&
+        strstr(info->name, "loudness-limiter") == NULL) {
+        s->hardware_sink = strdup(info->name);
+        enable_hardware_audio(s);
+        free(s->original_sink);
+        s->original_sink = strdup(info->name);
+
+        scan_stale_modules(s);
+    }
+}
+
 static void server_info(pa_context *c, const pa_server_info *info, void *userdata) {
     state *s = userdata;
     if (!info || !info->default_sink_name) {
         stopping = 1;
         return;
     }
-    free(s->original_sink);
-    s->original_sink = strdup(info->default_sink_name);
-    if (!s->hardware_sink)
-        s->hardware_sink = strdup(info->default_sink_name);
-
     if (extract_embedded_plugin(s) != 0) {
         fprintf(stderr, "无法写出内嵌 LADSPA 插件。\n");
         stopping = 1;
         return;
     }
 
-    char args[8192];
-    snprintf(args, sizeof(args),
-             "sink_name=%s sink_master=%s plugin=%s label=loudness_limiter_native "
-             "control=-18,6,%.1f",
-             VIRTUAL_SINK, s->hardware_sink, s->extracted_plugin, s->limit_db);
-    pa_context_load_module(c, "module-ladspa-sink", args, module_loaded, s);
+    free(s->original_sink);
+    s->original_sink = strdup(info->default_sink_name);
+
+    if (strstr(info->default_sink_name, "loudness_limiter") != NULL ||
+        strstr(info->default_sink_name, "loudness-limiter") != NULL) {
+        pa_context_get_sink_info_list(c, hardware_sink_selected, s);
+        return;
+    }
+
+    if (!s->hardware_sink)
+        s->hardware_sink = strdup(info->default_sink_name);
+
+    enable_hardware_audio(s);
+    scan_stale_modules(s);
 }
 
 static void context_state(pa_context *c, void *userdata) {
@@ -408,6 +610,7 @@ int main(int argc, char **argv) {
     s.limit_db = s.default_limit_db;
     s.shared_limit = s.limit_db;
     s.module_index = PA_INVALID_INDEX;
+    s.watchdog_write_fd = -1;
 
     static const struct option options[] = {
         {"limit", required_argument, NULL, 'l'},
@@ -482,6 +685,15 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
+    signal(SIGQUIT, on_signal);
+    signal(SIGABRT, on_signal);
+    signal(SIGFPE, on_signal);
+    signal(SIGILL, on_signal);
+    signal(SIGSEGV, on_signal);
+    signal(SIGBUS, on_signal);
+
+    start_watchdog(&s);
 
     s.mainloop = pa_mainloop_new();
     if (!s.mainloop) { fprintf(stderr, "无法创建音频事件循环。\n"); return 1; }
@@ -495,6 +707,8 @@ int main(int argc, char **argv) {
     if (pa_context_connect(s.context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
         fprintf(stderr, "无法连接 PulseAudio/PipeWire：%s\n", pa_strerror(pa_context_errno(s.context)));
         restore_terminal(&s);
+        stop_watchdog(&s);
+        remove_extracted_plugin(&s);
         return 1;
     }
 
@@ -512,6 +726,7 @@ int main(int argc, char **argv) {
     pa_context_disconnect(s.context);
     pa_context_unref(s.context);
     pa_mainloop_free(s.mainloop);
+    stop_watchdog(&s);
     remove_extracted_plugin(&s);
 
     if (s.shared_limit_ptr) munmap((void *)s.shared_limit_ptr, sizeof(float));
