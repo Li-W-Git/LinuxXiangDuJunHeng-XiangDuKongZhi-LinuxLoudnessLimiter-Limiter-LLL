@@ -13,10 +13,12 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 #define VIRTUAL_SINK "loudness_limiter_native"
-#define PLUGIN_NAME "/usr/local/lib/loudness-limiter/loudness-limiter-ladspa.so"
 #define SHM_NAME "/loudness-limiter-limit"
 
 typedef struct {
@@ -34,11 +36,80 @@ typedef struct {
     bool stdin_thread_started;
     struct termios original_terminal;
     bool terminal_changed;
+    char *extracted_plugin;
 } state;
+
+extern const unsigned char _binary_loudness_limiter_ladspa_so_start[];
+extern const unsigned char _binary_loudness_limiter_ladspa_so_end[];
 
 static volatile sig_atomic_t stopping;
 static void on_signal(int sig) { (void)sig; stopping = 1; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void remove_extracted_plugin(state *s) {
+    if (s->extracted_plugin) {
+        unlink(s->extracted_plugin);
+        free(s->extracted_plugin); s->extracted_plugin = NULL;
+    }
+}
+
+static int extract_embedded_plugin(state *s) {
+    char executable[4096];
+    ssize_t executable_len = readlink("/proc/self/exe", executable,
+                                      sizeof(executable) - 1);
+    char candidates[2][8192];
+    int candidate_count = 0;
+
+    if (executable_len > 0) {
+        executable[executable_len] = '\0';
+        char *slash = strrchr(executable, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(candidates[candidate_count++], sizeof(candidates[0]),
+                     "%s/.loudness-limiter-ladspa.so", executable);
+        }
+    }
+
+    const char *home = getenv("HOME");
+    if (home && *home)
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]),
+                 "%s/.cache/loudness-limiter-ladspa.so", home);
+
+    const unsigned char *start = _binary_loudness_limiter_ladspa_so_start;
+    size_t size = (size_t)(_binary_loudness_limiter_ladspa_so_end - start);
+
+    for (int c = 0; c < candidate_count; ++c) {
+        char *slash = strrchr(candidates[c], '/');
+        if (slash) {
+            *slash = '\0';
+            if (mkdir(candidates[c], 0700) != 0 && errno != EEXIST) {
+                *slash = '/';
+                continue;
+            }
+            *slash = '/';
+        }
+
+        int fd = open(candidates[c], O_WRONLY | O_CREAT | O_TRUNC, 0700);
+        if (fd < 0) continue;
+
+        size_t written = 0;
+        int failed = 0;
+        while (written < size) {
+            ssize_t n = write(fd, start + written, size - written);
+            if (n <= 0) { failed = 1; break; }
+            written += (size_t)n;
+        }
+        fsync(fd);
+        close(fd);
+
+        if (!failed) {
+            s->extracted_plugin = strdup(candidates[c]);
+            return s->extracted_plugin ? 0 : -1;
+        }
+        unlink(candidates[c]);
+    }
+    return -1;
+}
 
 static void restore_terminal(state *s) {
     if (s->terminal_changed) {
@@ -118,6 +189,7 @@ static void cleanup(state *s) {
         pa_context_unload_module(s->context, s->module_index, NULL, NULL);
     for (int n = 0; n < 1000; ++n)
         pa_mainloop_iterate(s->mainloop, 0, NULL);
+    remove_extracted_plugin(s);
 }
 
 static void module_loaded(pa_context *c, uint32_t index, void *userdata) {
@@ -147,44 +219,17 @@ static void server_info(pa_context *c, const pa_server_info *info, void *userdat
     if (!s->hardware_sink)
         s->hardware_sink = strdup(info->default_sink_name);
 
-    char plugin[1024];
-    plugin[0] = '\0';
-    char executable[1024];
-    ssize_t executable_len = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
-    if (executable_len > 0) {
-        executable[executable_len] = '\0';
-        char *slash = strrchr(executable, '/');
-        if (slash) {
-            *slash = '\0';
-            size_t dir_len = strlen(executable);
-            if (dir_len < sizeof(plugin) - 28)
-                snprintf(plugin, sizeof(plugin), "%s/loudness-limiter-ladspa.so", executable);
-            if (access(plugin, R_OK) != 0)
-                plugin[0] = '\0';
-        }
-    } else {
-        plugin[0] = '\0';
+    if (extract_embedded_plugin(s) != 0) {
+        fprintf(stderr, "无法写出内嵌 LADSPA 插件。\n");
+        stopping = 1;
+        return;
     }
 
-    if (!plugin[0] && access(PLUGIN_NAME, R_OK) == 0) {
-        snprintf(plugin, sizeof(plugin), "%s", PLUGIN_NAME);
-    } else if (!plugin[0]) {
-        const char *home = getenv("HOME");
-        if (home && *home) {
-            snprintf(plugin, sizeof(plugin), "%s/.local/lib/loudness-limiter/loudness-limiter-ladspa.so", home);
-        }
-    }
-    if (!plugin[0]) {
-        char cwd[1024];
-        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
-        snprintf(plugin, sizeof(plugin), "%s/loudness-limiter-ladspa.so", cwd);
-    }
-
-    char args[2048];
+    char args[8192];
     snprintf(args, sizeof(args),
              "sink_name=%s sink_master=%s plugin=%s label=loudness_limiter_native "
              "control=-18,6,%.1f",
-             VIRTUAL_SINK, s->hardware_sink, plugin, s->limit_db);
+             VIRTUAL_SINK, s->hardware_sink, s->extracted_plugin, s->limit_db);
     pa_context_load_module(c, "module-ladspa-sink", args, module_loaded, s);
 }
 
@@ -467,6 +512,7 @@ int main(int argc, char **argv) {
     pa_context_disconnect(s.context);
     pa_context_unref(s.context);
     pa_mainloop_free(s.mainloop);
+    remove_extracted_plugin(&s);
 
     if (s.shared_limit_ptr) munmap((void *)s.shared_limit_ptr, sizeof(float));
     if (s.shm_fd >= 0) close(s.shm_fd);

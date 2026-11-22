@@ -1,6 +1,6 @@
-# LinuxXiangDuJunHeng-XiangDuKongZhi-LinuxLoudnessLimiter-Limiter-LLL
-Linux 原生实时响度均衡程序。使用 PulseAudio `module-ladspa-sink` 在 PipeWire/PulseAudio 的音频图内处理，不使用 monitor 录制和独立回放桥接，没有额外播放时钟和明显缓冲积压。
+# Linux 响度均衡器
 
+Linux 原生实时响度均衡程序。使用 PulseAudio `module-ladspa-sink` 在 PipeWire/PulseAudio 的音频图内处理，不使用 monitor 录制和独立回放桥接。LADSPA 插件已编进单个主程序，运行时只写入用户可访问的私有临时共享库并在退出时删除。
 
 ## 功能
 
